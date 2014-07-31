@@ -30,9 +30,10 @@ from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout
 from swift.common.ring import Ring
 from swift.common.utils import get_logger, config_true_value, ismount, \
-    dump_recon_cache, quorum_size, Timestamp
+    dump_recon_cache, Timestamp
 from swift.common.daemon import Daemon
 from swift.common.http import is_success, HTTP_INTERNAL_SERVER_ERROR
+from swift.common.storage_policy import POLICIES
 
 
 class ContainerUpdater(Daemon):
@@ -228,7 +229,8 @@ class ContainerUpdater(Daemon):
             for event in events:
                 if is_success(event.wait()):
                     successes += 1
-            if successes >= quorum_size(len(events)):
+            policy = POLICIES.get_by_index(info['storage_policy_index'])
+            if successes >= policy.quorum_size(len(events)):
                 self.logger.increment('successes')
                 self.successes += 1
                 self.logger.debug(

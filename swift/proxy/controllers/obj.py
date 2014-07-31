@@ -38,7 +38,7 @@ from eventlet.timeout import Timeout
 from swift.common.utils import (
     clean_content_type, config_true_value, ContextPool, csv_append,
     GreenAsyncPile, GreenthreadSafeIterator, json, Timestamp,
-    normalize_delete_at_timestamp, public, quorum_size)
+    normalize_delete_at_timestamp, public)
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_metadata, check_object_creation, \
     check_copy_from_header
@@ -58,6 +58,7 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
     HTTPClientDisconnect, HTTPNotImplemented
 from swift.common.request_helpers import is_sys_or_user_meta, is_sys_meta, \
     remove_items, copy_header_subset
+from swift.common.storage_policy import POLICIES
 
 
 def copy_headers_into(from_r, to_r):
@@ -379,6 +380,14 @@ class ObjectController(Controller):
                     node, _('Object'),
                     _('Expect: 100-continue on %s') % path)
 
+    def _quorum_size(self, n, policy_index):
+        """
+        Number of successful backend requests needed for the proxy to consider
+        the client request successful.
+        """
+        policy = POLICIES.get_by_index(policy_index)
+        return policy.quorum_size(n)
+
     def _get_put_responses(self, req, conns, nodes):
         statuses = []
         reasons = []
@@ -413,7 +422,12 @@ class ObjectController(Controller):
                          'body': bodies[-1][:1024], 'path': req.path})
                 elif is_success(response.status):
                     etags.add(response.getheader('etag').strip('"'))
-                if self.have_quorum(statuses, len(nodes)):
+                container_info = self.container_info(
+                    self.account_name, self.container_name, req)
+                policy_index = \
+                    req.headers.get('X-Backend-Storage-Policy-Index',
+                                    container_info['storage_policy'])
+                if self.have_quorum(statuses, len(nodes), policy_index):
                     break
         # give any pending requests *some* chance to finish
         pile.waitall(self.app.post_quorum_timeout)
@@ -683,7 +697,7 @@ class ObjectController(Controller):
                        self.app.logger.thread_locals)
 
         conns = [conn for conn in pile if conn]
-        min_conns = quorum_size(len(nodes))
+        min_conns = self._quorum_size(len(nodes), policy_index)
 
         if req.if_none_match is not None and '*' in req.if_none_match:
             statuses = [conn.resp.status for conn in conns if conn.resp]
