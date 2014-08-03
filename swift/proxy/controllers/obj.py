@@ -57,8 +57,9 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
     HTTPServerError, HTTPServiceUnavailable, Request, \
     HTTPClientDisconnect, HTTPNotImplemented
 from swift.common.request_helpers import is_sys_or_user_meta, is_sys_meta, \
-    remove_items, copy_header_subset
+    remove_items, copy_header_subset, ObjectPayloadTrailer
 from swift.common.storage_policy import POLICIES
+from hashlib import md5
 
 
 def copy_headers_into(from_r, to_r):
@@ -684,6 +685,17 @@ class ObjectController(Controller):
         te = req.headers.get('transfer-encoding', '')
         chunked = ('chunked' in te)
 
+        # Tell object servers about trailer magic
+        req.headers['X-Backend-Payload-Trailer-Magic'] = \
+            ObjectPayloadTrailer.trailer_magic
+        trailer_size = ObjectPayloadTrailer.get_trailer_size()
+        req.headers['X-Backend-Payload-Trailer-Length'] = trailer_size
+
+        # Add trailer length to 'Content-Length'
+        if req.content_length > 0 and not chunked:
+            req.content_length += trailer_size
+            req.headers['Content-Length'] = str(req.content_length)
+
         outgoing_headers = self._backend_requests(
             req, len(nodes), container_partition, containers,
             delete_at_container, delete_at_part, delete_at_nodes)
@@ -715,6 +727,7 @@ class ObjectController(Controller):
                 {'conns': len(conns), 'nodes': min_conns})
             return HTTPServiceUnavailable(request=req)
         bytes_transferred = 0
+        object_etag = md5()
         try:
             with ContextPool(len(nodes)) as pool:
                 for conn in conns:
@@ -726,11 +739,9 @@ class ObjectController(Controller):
                         try:
                             chunk = next(data_source)
                         except StopIteration:
-                            if chunked:
-                                for conn in conns:
-                                    conn.queue.put('0\r\n\r\n')
                             break
                     bytes_transferred += len(chunk)
+                    object_etag.update(chunk)
                     if bytes_transferred > constraints.MAX_FILE_SIZE:
                         return HTTPRequestEntityTooLarge(request=req)
                     for conn in list(conns):
@@ -746,6 +757,23 @@ class ObjectController(Controller):
                             ' send, %(conns)s/%(nodes)s required connections'),
                             {'conns': len(conns), 'nodes': min_conns})
                         return HTTPServiceUnavailable(request=req)
+                # Time to send payload trailer
+                for conn in conns:
+                    # For now, payload etag and original object
+                    # etags are identical (given object data is
+                    # not modified by the proxy server)
+                    trailer = ObjectPayloadTrailer(
+                        object_etag, bytes_transferred,
+                        object_etag)
+                    trailer_bytes = trailer.serialize()
+                    conn.queue.put(
+                        '%x\r\n%s\r\n' %
+                        (len(trailer_bytes), trailer_bytes)
+                        if chunked else trailer_bytes)
+                bytes_transferred += len(trailer_bytes)
+                if chunked:
+                    for conn in conns:
+                        conn.queue.put('0\r\n\r\n')
                 for conn in conns:
                     if conn.queue.unfinished_tasks:
                         conn.queue.join()

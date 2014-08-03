@@ -28,8 +28,9 @@ from urllib import unquote
 from swift.common.constraints import FORMAT2CONTENT_TYPE
 from swift.common.exceptions import ListingIterError, SegmentError
 from swift.common.http import is_success, HTTP_SERVICE_UNAVAILABLE
-from swift.common.swob import HTTPBadRequest, HTTPNotAcceptable
-from swift.common.utils import split_path, validate_device_partition
+from swift.common.swob import HTTPBadRequest, HTTPNotAcceptable, \
+    HTTPServerError
+from swift.common.utils import split_path, validate_device_partition, json
 from swift.common.wsgi import make_subrequest
 
 
@@ -419,3 +420,150 @@ class SegmentedIterable(object):
             if self.response:
                 self.response.status = HTTP_SERVICE_UNAVAILABLE
             raise
+
+
+class ObjectPayloadTrailer(object):
+    """
+    Generic payload trailer class.  Defines a payload trailer that proxy
+    server sends to the object server at the end of object data stream.
+    Useful when the object data is modified at the proxy server (encrypted,
+    erasure coded etc) before streaming it down to the object server.
+    In such cases the object server has no way of knowing/calcuating the
+    original object size (in the erasure coding case) and/or the md5sum
+    for the original object data (in the encryption/erasure coding cases).
+    The proxy needs to send this information to the object server so the
+    object server can update metadata.
+
+    default trailer template:
+    {
+        'ETag': payload md5sum
+        'X-Object-Content-Length': original object size,
+        'X-Object-ETag': original object m5sum
+    }
+    """
+    trailer_magic = '\xfb\xc5\xd6\xee'
+    num_obj_size_bytes = 24
+    num_etag_bytes = 32
+
+    trailer_size_bytes = 0
+
+    def __init__(self, payload_etag, orig_object_size, orig_object_etag):
+
+        size_bytes = ObjectPayloadTrailer.num_obj_size_bytes
+
+        size = bytes(orig_object_size)
+        size = size.zfill(size_bytes)
+        if len(size) > size_bytes:
+            size = size[:size_bytes]
+
+        # This can be different from the object metadata when the original
+        # object data is mangled (example: erasure coded object that's encoded
+        # and thus split into n fragments)
+        payload_meta = {
+            'ETag': payload_etag.hexdigest(),
+        }
+
+        # Original object metadata
+        object_meta = {
+            'X-Object-Content-Length': size,
+            'X-Object-ETag': orig_object_etag.hexdigest(),
+        }
+
+        self._payload_trailer = dict()
+        self._payload_trailer.update(payload_meta)
+        self._payload_trailer.update(object_meta)
+
+    def serialize(self):
+        """
+        Constructs trailer in the format:
+            trailer magic
+            trailer md5sum
+            trailer bytes (serialized JSON)
+
+        :returns trailer as a series of bytes, including JSON
+                 encoded stream for the payload trailer
+        """
+        magic = ObjectPayloadTrailer.trailer_magic
+
+        # JSON-encode trailer data
+        # Make to set sort_keys to True as the keys can get reordered
+        # and our md5sums may not match when we try to verify the
+        # decoded JSON data with md5sum
+        try:
+            trailer_json_bytes = json.dumps(
+                self._payload_trailer, sort_keys=True).encode('utf-8')
+        except TypeError:
+            raise HTTPServerError('Internal server error when JSON encoding '
+                                  'payload trailer data')
+        except UnicodeEncodeError:
+            raise HTTPServerError('Internal server error when UTF-8 encoding '
+                                  'payload trailer data')
+
+        trailer_md5sum = hashlib.md5()
+        trailer_md5sum.update(trailer_json_bytes)
+
+        trailer = []
+
+        # trailer magic in the front
+        trailer.append(magic)
+
+        # trailer magic follows the trailer md5sum
+        trailer.append(trailer_md5sum.hexdigest())
+
+        # and the actual trailer data
+        trailer.append(trailer_json_bytes)
+
+        return b''.join(trailer)
+
+    @staticmethod
+    def deserialize(trailer_bytes):
+        """
+        Verifies trailer md5 hash and unpacks trailer data
+        Assumes trailer_bytes a byte string
+
+        :param      trailer_bytes trailer byte stream received
+        :returns    JSON-decoded trailer as a dict
+        """
+        magic = ObjectPayloadTrailer.trailer_magic
+        etag_bytes = ObjectPayloadTrailer.num_etag_bytes
+
+        # Strip trailer magic
+        trailer_offset = trailer_bytes.find(magic)
+        if trailer_offset < 0:
+            raise HTTPServerError('Invalid Object payload trailer')
+        trailer_bytes = trailer_bytes[(trailer_offset + len(magic)):]
+
+        # Get trailer md5sum
+        rcvd_md5sum = trailer_bytes[:etag_bytes]
+
+        # Verify trailer payload md5sum
+        trailer_bytes = trailer_bytes[etag_bytes:]
+        trailer_md5sum = hashlib.md5()
+        trailer_md5sum.update(trailer_bytes)
+
+        if rcvd_md5sum != trailer_md5sum.hexdigest():
+            raise HTTPServerError('Object payload trailer checksum mismatch!')
+
+        # Decode trailer data
+        try:
+            trailer = json.loads(trailer_bytes)
+        except json.JSONDecodeError:
+            raise HTTPServerError(
+                detail='Cannot decode Object payload trailer although '
+                'payload checksum matches!')
+        return trailer
+
+    @staticmethod
+    def get_trailer_size():
+        """
+        Constructs a dummy trailer and returns anticipated size.
+
+        :returns    trailer size in bytes
+        """
+        if ObjectPayloadTrailer.trailer_size_bytes == 0:
+            # Do this only on the first invocation
+            trailer = ObjectPayloadTrailer(hashlib.md5(), 1024, hashlib.md5())
+            trailer_bytes = trailer.serialize()
+            ObjectPayloadTrailer.trailer_size_bytes = len(trailer_bytes)
+
+        return ObjectPayloadTrailer.trailer_size_bytes

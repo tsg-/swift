@@ -39,7 +39,7 @@ from swift.common.exceptions import ConnectionTimeout, DiskFileQuarantined, \
 from swift.obj import ssync_receiver
 from swift.common.http import is_success
 from swift.common.request_helpers import get_name_and_placement, \
-    is_user_meta, is_sys_or_user_meta
+    is_user_meta, is_sys_or_user_meta, ObjectPayloadTrailer
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     HTTPInternalServerError, HTTPNoContent, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPRequestTimeout, HTTPUnprocessableEntity, \
@@ -384,6 +384,13 @@ class ObjectController(object):
         except ValueError as e:
             return HTTPBadRequest(body=str(e), request=request,
                                   content_type='text/plain')
+        payload_trailer_magic = request.headers.get(
+            'X-Backend-Payload-Trailer-Magic') or None
+        if payload_trailer_magic:
+            if fsize > 0:
+                payload_trailer_size = \
+                    request.headers['X-Backend-Payload-Trailer-Length']
+                fsize -= int(payload_trailer_size)
         try:
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
@@ -411,8 +418,12 @@ class ObjectController(object):
                 headers={'X-Backend-Timestamp': orig_timestamp.internal})
         orig_delete_at = int(orig_metadata.get('X-Delete-At') or 0)
         upload_expiration = time.time() + self.max_upload_time
+
         etag = md5()
         elapsed_time = 0
+
+        trailer = []
+        trailer_found = False
         try:
             with disk_file.create(size=fsize) as writer:
                 upload_size = 0
@@ -428,8 +439,21 @@ class ObjectController(object):
                         if start_time > upload_expiration:
                             self.logger.increment('PUT.timeouts')
                             return HTTPRequestTimeout(request=request)
-                        etag.update(chunk)
-                        upload_size = writer.write(chunk)
+                        if not payload_trailer_magic:
+                            etag.update(chunk)
+                            upload_size = writer.write(chunk)
+                        else:
+                            if not trailer_found:
+                                trailer_loc = chunk.find(payload_trailer_magic)
+                                if trailer_loc >= 0:
+                                    # Trailer found
+                                    trailer.append(chunk[trailer_loc:])
+                                    chunk = chunk[:trailer_loc]
+                                    trailer_found = True
+                                etag.update(chunk)
+                                upload_size = writer.write(chunk)
+                            else:
+                                trailer.append(chunk)
                         elapsed_time += time.time() - start_time
                 except ChunkReadTimeout:
                     return HTTPRequestTimeout(request=request)
@@ -443,6 +467,19 @@ class ObjectController(object):
                 if 'etag' in request.headers and \
                         request.headers['etag'].lower() != etag:
                     return HTTPUnprocessableEntity(request=request)
+
+                object_meta = None
+                if trailer_found:
+                    # Extract trailer metadata
+                    trailer_bytes = b''.join(trailer)
+                    object_meta = \
+                        ObjectPayloadTrailer.deserialize(trailer_bytes)
+                    # Make sure payload metadata matches etag
+                    if 'ETag' in object_meta and \
+                            object_meta['ETag'].lower() != etag:
+                        return HTTPUnprocessableEntity(request=request)
+
+                etag = etag if object_meta is None else object_meta['ETag']
                 metadata = {
                     'X-Timestamp': request.timestamp.internal,
                     'Content-Type': request.headers['content-type'],
@@ -451,6 +488,9 @@ class ObjectController(object):
                 }
                 metadata.update(val for val in request.headers.iteritems()
                                 if is_sys_or_user_meta('object', val[0]))
+                # Merge opqaue metadata passed to us in the trailer
+                if object_meta:
+                    metadata.update(object_meta)
                 for header_key in (
                         request.headers.get('X-Backend-Replication-Headers') or
                         self.allowed_headers):
@@ -469,13 +509,17 @@ class ObjectController(object):
                 self.delete_at_update(
                     'DELETE', orig_delete_at, account, container, obj,
                     request, device, policy_idx)
+        object_etag = metadata['ETag'] if object_meta is None else \
+            object_meta['X-Object-ETag']
+        object_len = metadata['Content-Length'] if object_meta is None else \
+            (int)(object_meta['X-Object-Content-Length'])
         self.container_update(
             'PUT', account, container, obj, request,
             HeaderKeyDict({
-                'x-size': metadata['Content-Length'],
+                'x-size': object_len,
                 'x-content-type': metadata['Content-Type'],
                 'x-timestamp': metadata['X-Timestamp'],
-                'x-etag': metadata['ETag']}),
+                'x-etag': object_etag}),
             device, policy_idx)
         return HTTPCreated(request=request, etag=etag)
 
@@ -515,6 +559,10 @@ class ObjectController(object):
                 response.last_modified = math.ceil(float(file_x_ts))
                 response.content_length = obj_size
                 try:
+                    response.headers['X-Object-Content-Length'] = metadata[
+                        'X-Object-Content-Length']
+                    response.headers['X-Object-ETag'] = metadata[
+                        'X-Object-ETag']
                     response.content_encoding = metadata[
                         'Content-Encoding']
                 except KeyError:
@@ -557,7 +605,14 @@ class ObjectController(object):
             if is_sys_or_user_meta('object', key) or \
                     key.lower() in self.allowed_headers:
                 response.headers[key] = value
-        response.etag = metadata['ETag']
+        if 'X-Object-Content-Length' in metadata:
+            response.etag = metadata['X-Object-Content-Length']
+        else:
+            response.etag = metadata['ETag']
+        if 'X-Object-ETag' in metadata:
+            response.etag = metadata['X-Object-ETag']
+        else:
+            response.etag = metadata['ETag']
         ts = Timestamp(metadata['X-Timestamp'])
         response.last_modified = math.ceil(float(ts))
         # Needed for container sync feature
