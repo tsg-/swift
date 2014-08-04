@@ -47,6 +47,7 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     HTTPInsufficientStorage, HTTPForbidden, HTTPException, HeaderKeyDict, \
     HTTPConflict
 from swift.obj.diskfile import DATAFILE_SYSTEM_META, DiskFileManager
+from swift.common.storage_policy import POLICIES, EC_POLICY
 
 
 class ObjectController(object):
@@ -365,6 +366,14 @@ class ObjectController(object):
         disk_file.write_metadata(metadata)
         return HTTPAccepted(request=request)
 
+    # TBD - Make this part of common StoragePolicy code
+    def _ec_pack_fragment_metadata(self, res, metadata):
+        """ Extract metadata for Erasure Coded object """
+        res.headers['X-EC-Type-Version'] = metadata['X-EC-Type-Version']
+        res.headers['X-EC-Segment-Size'] = metadata['X-EC-Segment-Size']
+        res.headers['X-EC-Fragment-Size'] = metadata['X-EC-Fragment-Size']
+        return metadata
+
     def _ec_unpack_fragment_metadata(self, req):
         """ Extract metadata for Erasure Coded object """
         ec_metadata = dict()
@@ -594,6 +603,8 @@ class ObjectController(object):
                         'Content-Encoding']
                 except KeyError:
                     pass
+                if POLICIES.get_by_index(policy_idx).policy_type == EC_POLICY:
+                    self._ec_pack_fragment_metadata(response, metadata)
                 response.headers['X-Timestamp'] = file_x_ts.normal
                 response.headers['X-Backend-Timestamp'] = file_x_ts.internal
                 resp = request.get_response(response)

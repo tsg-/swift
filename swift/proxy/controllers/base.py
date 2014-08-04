@@ -50,7 +50,7 @@ from swift.common.swob import Request, Response, HeaderKeyDict, Range, \
     HTTPException, HTTPRequestedRangeNotSatisfiable
 from swift.common.request_helpers import strip_sys_meta_prefix, \
     strip_user_meta_prefix, is_user_meta, is_sys_meta, is_sys_or_user_meta
-from swift.common.storage_policy import POLICIES
+from swift.common.storage_policy import POLICIES, EC_POLICY
 
 
 def update_headers(response, headers):
@@ -1199,8 +1199,17 @@ class Controller(object):
         backend_headers = self.generate_request_headers(
             req, additional=req.headers)
 
-        handler = GetOrHeadHandler(self.app, req, self.server_type, ring,
-                                   partition, path, backend_headers)
+        if 'X-Backend-Storage-Policy-Index' in req.headers:
+            policy = POLICIES.get_by_index(
+                (int)(req.headers['X-Backend-Storage-Policy-Index']))
+            if policy.policy_type == EC_POLICY \
+                    and self.server_type == 'Object':
+                handler = self.ec_GetOrHeadHandler(
+                    self.app, req, self.server_type, ring, partition, path,
+                    backend_headers)
+        else:
+            handler = GetOrHeadHandler(self.app, req, self.server_type, ring,
+                                       partition, path, backend_headers)
         res = handler.get_working_response(req)
 
         if not res:

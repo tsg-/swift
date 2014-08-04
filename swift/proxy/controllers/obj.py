@@ -49,18 +49,22 @@ from swift.common.exceptions import ChunkReadTimeout, \
 from swift.common.http import is_success, is_client_error, HTTP_CONTINUE, \
     HTTP_CREATED, HTTP_MULTIPLE_CHOICES, HTTP_NOT_FOUND, \
     HTTP_INTERNAL_SERVER_ERROR, HTTP_SERVICE_UNAVAILABLE, \
-    HTTP_INSUFFICIENT_STORAGE, HTTP_PRECONDITION_FAILED
+    HTTP_INSUFFICIENT_STORAGE, HTTP_PRECONDITION_FAILED, HTTP_OK, \
+    HTTP_PARTIAL_CONTENT
 from swift.proxy.controllers.base import Controller, delay_denial, \
-    cors_validation
+    cors_validation, close_swift_conn, source_key, update_headers, \
+    is_server_error
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPRequestEntityTooLarge, HTTPRequestTimeout, \
-    HTTPServerError, HTTPServiceUnavailable, Request, \
-    HTTPClientDisconnect, HTTPNotImplemented
+    HTTPServerError, HTTPServiceUnavailable, Request, Response, \
+    HTTPClientDisconnect, HTTPNotImplemented, HTTPException
 from swift.common.request_helpers import is_sys_or_user_meta, is_sys_meta, \
     remove_items, copy_header_subset, ObjectPayloadTrailer
 from swift.common.storage_policy import POLICIES, EC_POLICY
 from hashlib import md5
 from pyeclib.ec_iface import ECDriverError
+from swift.common.http import is_redirection
+from sys import exc_info
 
 
 def copy_headers_into(from_r, to_r):
@@ -85,6 +89,277 @@ def check_content_type(req):
     return None
 
 
+class ec_GetOrHeadHandler(object):
+
+    def __init__(self, app, req, server_type, ring, partition, path,
+                 backend_headers):
+        self.app = app
+        self.ring = ring
+        self.server_type = server_type
+        self.partition = partition
+        self.path = path
+        self.backend_headers = backend_headers
+        ## self.used_nodes = []
+        self.used_source_etag = ''
+
+        # stuff from request
+        self.req_method = req.method
+        self.req_path = req.path
+        self.req_query_string = req.query_string
+        self.newest = config_true_value(req.headers.get('x-newest', 'f'))
+
+        # populated when finding source
+        self.statuses = []
+        self.reasons = []
+        self.bodies = []
+        self.source_headers = []
+
+        policy = POLICIES.get_by_index(
+            (int)(req.headers['X-Backend-Storage-Policy-Index']))
+        self.ec_ndata = policy.ec_ndata
+        self.ec_nparity = policy.ec_nparity
+        self.pyeclib_driver = policy.ec_driver
+
+        # filled using headers rcvd from object server
+        self.ec_type = None
+        self.ec_fragment_size = None
+        self.ec_segment_size = None
+
+    def is_good_source(self, src):
+        """
+        Indicates whether or not the request made to the backend found
+        what it was looking for.
+
+        :param src: the response from the backend
+        :returns: True if found, False if not
+        """
+        if self.server_type == 'Object' and src.status == 416:
+            return True
+        return is_success(src.status) or is_redirection(src.status)
+
+    def _get_fragments_for_next_stripe(self, req, sources, node_timeout):
+
+        fragments = []
+        statuses = []
+        reasons = []
+        bodies = []
+
+        def _get_fragment(source, timeout):
+            try:
+                with ChunkReadTimeout(timeout):
+                    _fragment = source.read(self.ec_fragment_size)
+                    print "got fragment %d bytes" % len(_fragment)
+                    if source.resp:
+                        return _fragment, source, source.resp
+                    else:
+                        return _fragment, source, source.getresponse()
+            except ChunkReadTimeout:
+                self.app.exception_occurred(
+                    source.node, _('Object'),
+                    _('Trying to get fragment from source %r') % source)
+
+        pile = GreenAsyncPile(len(sources))
+        for source in sources:
+            pile.spawn(_get_fragment, source, node_timeout)
+
+        for fragment, source, response in pile:
+            if fragment:
+                fragments.append(fragment)
+                statuses.append(response.status)
+                reasons.append(response.reason)
+                bodies.append(response.read())
+                if response.status >= HTTP_INTERNAL_SERVER_ERROR:
+                    self.app.error_occurred(
+                        source.node,
+                        _('ERROR %(status)d %(body)s From Object Server '
+                          're: %(path)s') %
+                        {'status': response.status,
+                         'body': bodies[-1][:1024], 'path': req.path})
+                elif is_success(response.status):
+                    if len(statuses) == self.ec_ndata:
+                        break
+        # give any pending requests *some* chance to finish
+        pile.waitall(self.app.node_timeout)
+        while len(statuses) < self.ec_ndata:
+            statuses.append(HTTP_SERVICE_UNAVAILABLE)
+            reasons.append('')
+            bodies.append('')
+        return statuses, reasons, bodies, fragments
+
+    def _make_app_iter(self, req, sources):
+        try:
+            bytes_read_from_source = 0
+            node_timeout = self.app.node_timeout
+            if self.server_type == 'Object':
+                node_timeout = self.app.recoverable_node_timeout
+            while True:
+                try:
+                    statuses, reasons, bodies, \
+                        fragments = self._get_fragments_for_next_stripe(
+                            req, sources, node_timeout)
+                    stripe = self.ec_driver.decode(fragments)
+                    bytes_read_from_source += len(stripe)
+                    if bytes_read_from_source >= self.object_length:
+                        raise StopIteration
+                except ChunkReadTimeout:
+                    exc_type, exc_value, exc_traceback = exc_info()
+                    if self.newest or self.server_type != 'Object':
+                        raise exc_type, exc_value, exc_traceback
+                    try:
+                        self.fast_forward(bytes_read_from_source)
+                    except (NotImplementedError, HTTPException, ValueError):
+                        raise exc_type, exc_value, exc_traceback
+                    ## FIXME handle failure case
+                if not stripe:
+                    break
+                with ChunkWriteTimeout(self.app.client_timeout):
+                    yield stripe
+        except ChunkWriteTimeout:
+            self.app.logger.warn(
+                _('Client did not read from proxy within %ss') %
+                self.app.client_timeout)
+            self.app.logger.increment('client_timeouts')
+        except GeneratorExit:
+            if not req.environ.get('swift.non_client_disconnect'):
+                self.app.logger.warn(_('Client disconnected on read'))
+        except Exception:
+            self.app.logger.exception(_('Trying to send to client'))
+            raise
+        finally:
+            for source in sources:
+                # Close-out the connection as best as possible.
+                if getattr(source, 'swift_conn', None):
+                    close_swift_conn(source)
+
+    def _ec_unpack_fragment_metadata(self, src_headers):
+            self.ec_type = src_headers.get(
+                'X-EC-Type-Version', '').strip('"')
+            self.ec_fragment_size = src_headers.get(
+                'X-EC-Fragment-Size', '').strip('"')
+            self.ec_segment_size = src_headers.get(
+                'X-EC-Segment-Size', '').strip('"')
+            self.used_source_etag = src_headers.get(
+                'X-Object-ETag', '').strip('"')
+            self.object_length = src_headers.get(
+                'X-Object-Content-Length', '').strip('"')
+
+    def _get_sources(self):
+        self.statuses = []
+        self.reasons = []
+        self.bodies = []
+        self.source_headers = []
+        sources = []
+
+        node_timeout = self.app.node_timeout
+        if self.server_type == 'Object' and not self.newest:
+            node_timeout = self.app.recoverable_node_timeout
+        for node in self.app.iter_nodes(self.ring, self.partition):
+            start_node_timing = time.time()
+            try:
+                with ConnectionTimeout(self.app.conn_timeout):
+                    conn = http_connect(
+                        node['ip'], node['port'], node['device'],
+                        self.partition, self.req_method, self.path,
+                        headers=self.backend_headers,
+                        query_string=self.req_query_string)
+                self.app.set_node_timing(node, time.time() - start_node_timing)
+
+                with Timeout(node_timeout):
+                    possible_source = conn.getresponse()
+                    # See NOTE: swift_conn at top of file about this.
+                    possible_source.swift_conn = conn
+            except (Exception, Timeout):
+                self.app.exception_occurred(
+                    node, self.server_type,
+                    _('Trying to %(method)s %(path)s') %
+                    {'method': self.req_method, 'path': self.req_path})
+                continue
+            if self.is_good_source(possible_source):
+                # 404 if we know we don't have a synced copy
+                if not float(possible_source.getheader('X-PUT-Timestamp', 1)):
+                    self.statuses.append(HTTP_NOT_FOUND)
+                    self.reasons.append('')
+                    self.bodies.append('')
+                    self.source_headers.append('')
+                    close_swift_conn(possible_source)
+                else:
+                    if self.used_source_etag:
+                        src_headers = dict(
+                            (k.lower(), v) for k, v in
+                            possible_source.getheaders())
+                        if src_headers.get('etag', '').strip('"') != \
+                                self.used_source_etag:
+                            self.statuses.append(HTTP_NOT_FOUND)
+                            self.reasons.append('')
+                            self.bodies.append('')
+                            self.source_headers.append('')
+                            continue
+
+                    self.statuses.append(possible_source.status)
+                    self.reasons.append(possible_source.reason)
+                    self.bodies.append('')
+                    self.source_headers.append('')
+                    sources.append((possible_source, node))
+            else:
+                self.statuses.append(possible_source.status)
+                self.reasons.append(possible_source.reason)
+                self.bodies.append(possible_source.read())
+                self.source_headers.append(possible_source.getheaders())
+                if possible_source.status == HTTP_INSUFFICIENT_STORAGE:
+                    self.app.error_limit(node, _('ERROR Insufficient Storage'))
+                elif is_server_error(possible_source.status):
+                    self.app.error_occurred(
+                        node, _('ERROR %(status)d %(body)s '
+                                'From %(type)s Server') %
+                        {'status': possible_source.status,
+                         'body': self.bodies[-1][:1024],
+                         'type': self.server_type})
+
+        if sources and len(sources) >= self.ec_ndata:
+            sources.sort(key=lambda s: source_key(s[0]))
+            src_headers = dict(
+                (k.lower(), v) for k, v in
+                possible_source.getheaders())
+            self._ec_unpack_fragment_metadata(src_headers)
+            return sources
+        return None
+
+    def get_working_response(self, req):
+        sources = self._get_sources()
+        res = None
+        good_source = None
+        if sources:
+            res = Response(request=req)
+            if req.method == 'GET':
+                ngood_responses = 0
+                for source in sources:
+                    if source.status in (HTTP_OK, HTTP_PARTIAL_CONTENT):
+                        ngood_responses += 1
+                        if not good_source:
+                            good_source = source
+                if ngood_responses > self.ec_ndata:
+                    res.app_iter = self._make_app_iter(req, sources)
+                    res.swift_conn = source.swift_conn
+                # See NOTE: swift_conn at top of file about this.
+                # TBD res.swift_conn = source.swift_conn
+######################### WIP #######################
+                # FIXME - one source is enough?
+                if good_source:
+                    res.status = good_source.status
+                update_headers(res, good_source.getheaders())
+                if not res.environ:
+                    res.environ = {}
+                res.environ['swift_x_timestamp'] = \
+                    source.getheader('x-timestamp')
+                res.accept_ranges = 'bytes'
+                res.content_length = source.getheader('Content-Length')
+                if source.getheader('Content-Type'):
+                    res.charset = None
+                    res.content_type = source.getheader('Content-Type')
+######################### WIP #######################
+        return res
+
+
 class ObjectController(Controller):
     """WSGI controller for object requests."""
     server_type = 'Object'
@@ -95,6 +370,7 @@ class ObjectController(Controller):
         self.account_name = unquote(account_name)
         self.container_name = unquote(container_name)
         self.object_name = unquote(object_name)
+        self.ec_GetOrHeadHandler = ec_GetOrHeadHandler
 
     def _listing_iter(self, lcontainer, lprefix, env):
         for page in self._listing_pages_iter(lcontainer, lprefix, env):
