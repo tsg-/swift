@@ -6861,10 +6861,12 @@ class TestSwiftInfo(unittest.TestCase):
                          constraints.MAX_CONTAINER_NAME_LENGTH)
         self.assertEqual(si['max_object_name_length'],
                          constraints.MAX_OBJECT_NAME_LENGTH)
+        self.assertEqual(si['ec_object_segment_size'],
+                         constraints.EC_OBJECT_SEGMENT_SIZE)
         self.assertTrue('strict_cors_mode' in si)
         # this next test is deliberately brittle in order to alert if
         # other items are added to swift info
-        self.assertEqual(len(si), 14)
+        self.assertEqual(len(si), 15)
 
         self.assertTrue('policies' in si)
         sorted_pols = sorted(si['policies'], key=operator.itemgetter('name'))

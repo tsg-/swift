@@ -365,12 +365,26 @@ class ObjectController(object):
         disk_file.write_metadata(metadata)
         return HTTPAccepted(request=request)
 
+    def _ec_unpack_fragment_metadata(self, req):
+        """ Extract metadata for Erasure Coded object """
+        ec_metadata = dict()
+        ec_metadata['X-EC-Type-Version'] = \
+            req.headers.get('X-EC-Type-Version', "0")
+        ec_metadata['X-EC-Segment-Size'] = \
+            req.headers.get('X-EC-Segment-Size', "0")
+        ec_metadata['X-EC-Fragment-Size'] = \
+            req.headers.get('X-EC-Fragment-Size', "0")
+        return ec_metadata
+
     @public
     @timing_stats()
     def PUT(self, request):
         """Handle HTTP PUT requests for the Swift Object Server."""
         device, partition, account, container, obj, policy_idx = \
             get_name_and_placement(request, 5, 5, True)
+        ec_policy = False
+        if 'X-EC-Fragment-Size' in request.headers:
+            ec_policy = True
         req_timestamp = valid_timestamp(request)
         error_response = check_object_creation(request, obj)
         if error_response:
@@ -463,6 +477,15 @@ class ObjectController(object):
                         upload_size)
                 if fsize is not None and fsize != upload_size:
                     return HTTPClientDisconnect(request=request)
+
+                # Ignore etag comparison for the erasure_coding (EC) policies
+                # what client sends as 'etag' is the ETag for the entire
+                # object, and we only have ETag for a bunch of EC fragments
+                # being concatenated here.
+                if not ec_policy:
+                    if 'etag' in request.headers and \
+                            request.headers['etag'].lower() != etag:
+                        return HTTPUnprocessableEntity(request=request)
                 etag = etag.hexdigest()
                 if 'etag' in request.headers and \
                         request.headers['etag'].lower() != etag:
@@ -474,7 +497,7 @@ class ObjectController(object):
                     trailer_bytes = b''.join(trailer)
                     object_meta = \
                         ObjectPayloadTrailer.deserialize(trailer_bytes)
-                    # Make sure payload metadata matches etag
+                    # Make sure object metadata etag checks out
                     if 'ETag' in object_meta and \
                             object_meta['ETag'].lower() != etag:
                         return HTTPUnprocessableEntity(request=request)
@@ -497,6 +520,10 @@ class ObjectController(object):
                     if header_key in request.headers:
                         header_caps = header_key.title()
                         metadata[header_caps] = request.headers[header_key]
+                if ec_policy:
+                    ec_metadata = self._ec_unpack_fragment_metadata(request)
+                    if ec_metadata:
+                        metadata.update(ec_metadata)
                 writer.put(metadata)
         except DiskFileNoSpace:
             return HTTPInsufficientStorage(drive=device, request=request)

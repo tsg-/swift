@@ -290,6 +290,10 @@ class ECStoragePolicy(StoragePolicy):
     def ec_nparity(self):
         return self._ec_nparity
 
+    @property
+    def ec_driver(self):
+        return self._pyeclib_driver
+
     def quorum_size(self, n):
         """
         Number of successful backend requests needed for the proxy to consider

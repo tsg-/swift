@@ -33,6 +33,7 @@ CONTAINER_LISTING_LIMIT = 10000
 ACCOUNT_LISTING_LIMIT = 10000
 MAX_ACCOUNT_NAME_LENGTH = 256
 MAX_CONTAINER_NAME_LENGTH = 256
+EC_OBJECT_SEGMENT_SIZE = 1048576
 
 # If adding an entry to DEFAULT_CONSTRAINTS, note that
 # these constraints are automatically published by the
@@ -50,6 +51,7 @@ DEFAULT_CONSTRAINTS = {
     'account_listing_limit': ACCOUNT_LISTING_LIMIT,
     'max_account_name_length': MAX_ACCOUNT_NAME_LENGTH,
     'max_container_name_length': MAX_CONTAINER_NAME_LENGTH,
+    'ec_object_segment_size': EC_OBJECT_SEGMENT_SIZE,
 }
 
 SWIFT_CONSTRAINTS_LOADED = False

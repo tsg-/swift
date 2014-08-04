@@ -45,7 +45,7 @@ from swift.common.constraints import check_metadata, check_object_creation, \
 from swift.common import constraints
 from swift.common.exceptions import ChunkReadTimeout, \
     ChunkWriteTimeout, ConnectionTimeout, ListingIterNotFound, \
-    ListingIterNotAuthorized, ListingIterError
+    ListingIterNotAuthorized, ListingIterError, RingValidationError
 from swift.common.http import is_success, is_client_error, HTTP_CONTINUE, \
     HTTP_CREATED, HTTP_MULTIPLE_CHOICES, HTTP_NOT_FOUND, \
     HTTP_INTERNAL_SERVER_ERROR, HTTP_SERVICE_UNAVAILABLE, \
@@ -58,8 +58,9 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
     HTTPClientDisconnect, HTTPNotImplemented
 from swift.common.request_helpers import is_sys_or_user_meta, is_sys_meta, \
     remove_items, copy_header_subset, ObjectPayloadTrailer
-from swift.common.storage_policy import POLICIES
+from swift.common.storage_policy import POLICIES, EC_POLICY
 from hashlib import md5
+from pyeclib.ec_iface import ECDriverError
 
 
 def copy_headers_into(from_r, to_r):
@@ -393,15 +394,15 @@ class ObjectController(Controller):
         statuses = []
         reasons = []
         bodies = []
-        etags = set()
+        etags = dict()
 
         def get_conn_response(conn):
             try:
                 with Timeout(self.app.node_timeout):
                     if conn.resp:
-                        return conn.resp
+                        return conn, conn.resp
                     else:
-                        return conn.getresponse()
+                        return conn, conn.getresponse()
             except (Exception, Timeout):
                 self.app.exception_occurred(
                     conn.node, _('Object'),
@@ -409,7 +410,7 @@ class ObjectController(Controller):
         pile = GreenAsyncPile(len(conns))
         for conn in conns:
             pile.spawn(get_conn_response, conn)
-        for response in pile:
+        for conn, response in pile:
             if response:
                 statuses.append(response.status)
                 reasons.append(response.reason)
@@ -422,7 +423,7 @@ class ObjectController(Controller):
                         {'status': response.status,
                          'body': bodies[-1][:1024], 'path': req.path})
                 elif is_success(response.status):
-                    etags.add(response.getheader('etag').strip('"'))
+                    etags[conn] = response.getheader('etag').strip('"')
                 container_info = self.container_info(
                     self.account_name, self.container_name, req)
                 policy_index = \
@@ -474,6 +475,40 @@ class ObjectController(Controller):
 
         return req, delete_at_container, delete_at_part, delete_at_nodes
 
+    def _ec_pack_fragment_metadata(self, policy, req):
+        # fixed min object segment size we apply EC encode on
+        # It is chosen to be reasonably large so we don't end up with
+        # too many small fragments, or end up calling into expensive
+        # EC encode operations too many times.
+        ec_object_segment_size = constraints.EC_OBJECT_SEGMENT_SIZE
+
+        # For EC policies, we call PyECLib get_segment_info() routine to
+        # get info necessary to calculate total transfer size to the object
+        # server (PyECLib calculates data size taking into account any
+        # header/padding overheads for data fragments generated after
+        # EC encode operation
+        if req.content_length > 0:
+            data_length = req.content_length
+        else:
+            # Most likely chunked encoding.  We don't know the total
+            # object length being transferred from the client.
+            # Use ec_object_segment_size for ec_fragment_size calculation
+            data_length = ec_object_segment_size
+        ec_segment_info = \
+            policy.ec_driver.get_segment_info(data_length,
+                                              ec_object_segment_size)
+        ec_num_segments = ec_segment_info['num_segments']
+        ec_fragment_size = ec_segment_info['fragment_size']
+        ec_last_fragment_size = ec_segment_info['last_fragment_size']
+        # Add EC-specific headers to req.headers
+        req.headers['X-EC-Type-Version'] = policy.ec_type
+        req.headers['X-EC-Segment-Size'] = ec_object_segment_size
+        req.headers['X-EC-Fragment-Size'] = ec_fragment_size
+        # calculate total fragment archive transfer size to each object
+        ec_transfer_size = \
+            ((ec_num_segments - 1) * ec_fragment_size) + ec_last_fragment_size
+        return ec_object_segment_size, ec_fragment_size, ec_transfer_size
+
     @public
     @cors_validation
     @delay_denial
@@ -491,6 +526,16 @@ class ObjectController(Controller):
 
         # pass the policy index to storage nodes via req header
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
+        ec_policy = False
+        policy = POLICIES.get_by_index(policy_index)
+        if policy.policy_type == EC_POLICY:
+            # Early check to validate if the replica count for the
+            # policy is enough to hold (data + parity) nodes
+            try:
+                policy.validate_ring_replica_count(obj_ring.replica_count)
+            except RingValidationError:
+                return HTTPServerError(request=req)
+            ec_policy = True
         container_partition = container_info['partition']
         containers = container_info['nodes']
         req.acl = container_info['write_acl']
@@ -514,7 +559,17 @@ class ObjectController(Controller):
                                       body=str(e))
         if ml is not None and ml > constraints.MAX_FILE_SIZE:
             return HTTPRequestEntityTooLarge(request=req)
-
+        if 'x-delete-after' in req.headers:
+            try:
+                x_delete_after = int(req.headers['x-delete-after'])
+            except ValueError:
+                return HTTPBadRequest(request=req,
+                                      content_type='text/plain',
+                                      body='Non-integer X-Delete-After')
+            req.headers['x-delete-at'] = normalize_delete_at_timestamp(
+                time.time() + x_delete_after)
+        # get_nodes returns (ndata + nparity) nodes for object rings
+        # configured with erasure_coding policy type
         partition, nodes = obj_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
 
@@ -691,8 +746,17 @@ class ObjectController(Controller):
         trailer_size = ObjectPayloadTrailer.get_trailer_size()
         req.headers['X-Backend-Payload-Trailer-Length'] = trailer_size
 
-        # Add trailer length to 'Content-Length'
         if req.content_length > 0 and not chunked:
+            # if HTTP encoding is non-chunked, we need to prefill the
+            # Content-Length header.  Content length (transfer size)
+            # is not the same as original object length for EC policies
+            if ec_policy:
+                ec_object_segment_size, ec_fragment_size, transfer_size = \
+                    self._ec_pack_fragment_metadata(policy, req)
+                req.content_length = transfer_size
+            else:
+                transfer_size = req.content_length
+            # Add trailer length to 'Content-Length'
             req.content_length += trailer_size
             req.headers['Content-Length'] = str(req.content_length)
 
@@ -726,29 +790,99 @@ class ObjectController(Controller):
                   'required connections'),
                 {'conns': len(conns), 'nodes': min_conns})
             return HTTPServiceUnavailable(request=req)
+        # In the erasure_coding case, we stream individual fragments to
+        # respective nodes/connections, which get accumulated into
+        # 'fragment archives' on the object server
+        ec_fragments = ec_fragment = None
+        ec_segment_etag = md5()
+        # Create a conn:etag association for the fragment archives
+        ec_fragarchive_etags = []
+        for i in range(len(conns)):
+            ec_fragarchive_etags.extend([md5()])
+        ec_fragarchive_etags_dict = dict(zip(conns, ec_fragarchive_etags))
+        # Running etag for original object data (for trailer)
+        orig_object_etag = md5()
+        # Bytes transferred and object_bytes_transferred can be different
+        # where the original object data is mangled and additional metadata
+        # is added to record modifications to the original data
         bytes_transferred = 0
-        object_etag = md5()
+        object_bytes_transferred = 0
         try:
             with ContextPool(len(nodes)) as pool:
                 for conn in conns:
                     conn.failed = False
                     conn.queue = Queue(self.app.put_queue_depth)
                     pool.spawn(self._send_file, conn, req.path)
+
+                _buffer = []
+                seg = next_seg = b''
                 while True:
                     with ChunkReadTimeout(self.app.client_timeout):
                         try:
-                            chunk = next(data_source)
+                            if ec_policy:
+                                _buffer = []
+                                leftover = seglen = 0
+                                # We buffer HTTP chunks until we have enough to
+                                # meet the ec_object_segment_size constraint.
+                                while seglen < ec_object_segment_size:
+                                    chunk = next(data_source)
+                                    seglen += len(chunk)
+                                    if seglen >= ec_object_segment_size:
+                                        # Buffer any leftover bytes
+                                        leftover = \
+                                            seglen - ec_object_segment_size
+                                        next_seg = chunk[:leftover]
+                                        chunk = chunk[leftover:]
+                                    _buffer.append(chunk)
+                                seg = b''.join(_buffer)
+                            else:
+                                chunk = next(data_source)
                         except StopIteration:
-                            break
-                    bytes_transferred += len(chunk)
-                    object_etag.update(chunk)
+                            if ec_policy:
+                                # Flush _buffer
+                                seg = b''.join(_buffer)
+                                if len(seg) == 0:
+                                    break
+                            else:
+                                break
+                    # If policy is erasure_coding, encode obj data into
+                    # ec_ndata + ec_nparity fragments. EC fragments are
+                    # streamed to the object server similar to non-EC objs
+                    if ec_policy:
+                        # Running md5sum for object data
+                        ec_segment_etag.update(seg)
+                        # OK to Encode and stream now
+                        try:
+                            ec_fragments = policy.ec_driver.encode(seg)
+                        except ECDriverError:
+                            self.app.logger.error(_(
+                                'Object PUT exception during'
+                                ' ec_driver.encode()'))
+                            return HTTPServerError(request=req)
+                        ec_fragment = iter(ec_fragments)
+
+                        bytes_transferred += len(ec_fragments[0])
+                        object_bytes_transferred += len(seg)
+                        seg = next_seg
+                        next_seg = ""
+                    else:
+                        orig_object_etag.update(chunk)
+                        bytes_transferred += len(chunk)
+
                     if bytes_transferred > constraints.MAX_FILE_SIZE:
                         return HTTPRequestEntityTooLarge(request=req)
                     for conn in list(conns):
                         if not conn.failed:
+                            if ec_policy:
+                                chunk = next(ec_fragment)
+                                # Choose fragment archive etag corresponding
+                                # to the connection object and update
+                                ec_fragarchive_etags_dict[conn].update(chunk)
                             conn.queue.put(
                                 '%x\r\n%s\r\n' % (len(chunk), chunk)
                                 if chunked else chunk)
+                            print(("conn %r, wrote %d bytes")
+                                  % (conn, len(chunk)))
                         else:
                             conns.remove(conn)
                     if len(conns) < min_conns:
@@ -757,14 +891,21 @@ class ObjectController(Controller):
                             ' send, %(conns)s/%(nodes)s required connections'),
                             {'conns': len(conns), 'nodes': min_conns})
                         return HTTPServiceUnavailable(request=req)
-                # Time to send payload trailer
+
+                orig_object_size = bytes_transferred
+                payload_etag = orig_object_etag
+                if ec_policy:
+                    orig_object_size = object_bytes_transferred
+                    orig_object_etag = ec_segment_etag
+                # Send payload trailer
                 for conn in conns:
-                    # For now, payload etag and original object
-                    # etags are identical (given object data is
-                    # not modified by the proxy server)
+                    # Erasure coding case: get etag for the fragment archive
+                    # being sent down this connection
+                    if ec_policy:
+                        payload_etag = \
+                            ec_fragarchive_etags_dict[conn]
                     trailer = ObjectPayloadTrailer(
-                        object_etag, bytes_transferred,
-                        object_etag)
+                        payload_etag, orig_object_size, orig_object_etag)
                     trailer_bytes = trailer.serialize()
                     conn.queue.put(
                         '%x\r\n%s\r\n' %
@@ -796,12 +937,30 @@ class ObjectController(Controller):
 
         statuses, reasons, bodies, etags = self._get_put_responses(req, conns,
                                                                    nodes)
-
-        if len(etags) > 1:
-            self.app.logger.error(
-                _('Object servers returned %s mismatched etags'), len(etags))
-            return HTTPServerError(request=req)
-        etag = etags.pop() if len(etags) else None
+        if ec_policy:
+            # Validate etags received in response against EC fragment etags
+            mismatched_etags = 0
+            for conn in conns:
+                fragarch_etag = ec_fragarchive_etags_dict[conn]
+                if fragarch_etag.hexdigest() != etags[conn]:
+                    mismatched_etags += 1
+                print "EC conn index = %d, etag = %r, resp_etag = %r" % \
+                    (conns.index(conn), fragarch_etag.hexdigest(),
+                     etags[conn])
+            if mismatched_etags > 0:
+                self.app.logger.error(
+                    _('Object servers returned %s mismatched etags'),
+                    len(etags))
+            # Respond with object etag
+            etag = orig_object_etag.hexdigest()
+        else:
+            etags = set(etags.values())
+            if len(etags) > 1:
+                self.app.logger.error(
+                    _('Object servers returned %s mismatched etags'),
+                    len(etags))
+                return HTTPServerError(request=req)
+            etag = etags.pop() if len(etags) else None
         resp = self.best_response(req, statuses, reasons, bodies,
                                   _('Object PUT'), etag=etag)
         if source_header:

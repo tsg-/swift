@@ -155,3 +155,9 @@ default = yes
 # of a container name
 
 #max_container_name_length = 256
+
+
+# before erasure coding, object is split into equal size segments
+# size of each segment = ec_object_segment_size, default 1MB
+
+#ec_object_segment_size = 1048576
