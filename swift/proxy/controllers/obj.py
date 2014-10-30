@@ -30,6 +30,7 @@ import time
 import math
 import random
 from hashlib import md5
+from pyeclib.ec_iface import ECDriverError
 from swift import gettext_ as _
 from urllib import unquote, quote
 
@@ -593,7 +594,7 @@ class ObjectController(Controller):
         statuses = []
         reasons = []
         bodies = []
-        etags = set()
+        etags = dict()
 
         def get_put_response(putter):
             try:
@@ -621,7 +622,7 @@ class ObjectController(Controller):
                     {'status': response.status,
                      'body': bodies[-1][:1024], 'path': req.path})
             elif is_success(response.status):
-                etags.add(response.getheader('etag').strip('"'))
+                etags[putter] = response.getheader('etag').strip('"')
 
         for (putter, response) in pile:
             if response:
@@ -678,6 +679,8 @@ class ObjectController(Controller):
             self.account_name, self.container_name, req)
         policy_index = req.headers.get('X-Backend-Storage-Policy-Index',
                                        container_info['storage_policy'])
+        policy = POLICIES.get_by_index(policy_index)
+        ec_policy = True if policy.policy_type == 'erasure_coding' else False
         obj_ring = self.app.get_object_ring(policy_index)
 
         # pass the policy index to storage nodes via req header
@@ -879,9 +882,20 @@ class ObjectController(Controller):
             # RFC2616:8.2.3 disallows 100-continue without a body
             if (req.content_length > 0) or chunked:
                 nheaders['Expect'] = '100-continue'
+            # We indicate that we always need a metadata footer
+            # for erasure coded objects, in which case the proxy->object
+            # encoding is always chunked, thus we shouldn't retain the
+            # Content-Length header.  We also remove the Etag header
+            # as the etag of the data being written to the object server
+            # is not the same as the original object etag as sent by client
+            if ec_policy:
+                nheaders.pop('Content-Length', None)
+                nheaders.pop('Etag', None)
+                req.content_length = None
             pile.spawn(self._connect_put_node, node_iter, partition,
                        req.swift_entity_path, nheaders,
-                       self.app.logger.thread_locals, chunked)
+                       self.app.logger.thread_locals, chunked,
+                       want_metadata_footer=ec_policy)
 
         putters = [p for p in pile if p]
         min_puts = self._quorum_size(len(nodes), req)
@@ -902,26 +916,91 @@ class ObjectController(Controller):
                 {'conns': len(putters), 'nodes': min_puts})
             return HTTPServiceUnavailable(request=req)
 
-        bytes_transferred = 0
+        # Running etag for segments as they are streamed in (gives us the
+        # object etag in the end)
+        object_etag = md5()
+
+        # Create a connection:etag association for object stream being sent
+        # down each connection
+        putter_tx_etags = []
+        for i in range(len(nodes)):
+            putter_tx_etags.extend([md5()])
+        ondisk_object_etags = dict(zip(putters, putter_tx_etags))
+        bytes_transferred = object_bytes_transferred = 0
         try:
             with ContextPool(len(putters)) as pool:
                 for putter in putters:
                     putter.spawn_sender_greenthread(
                         pool, self.app.put_queue_depth, self.app.node_timeout,
                         self.app.exception_occurred)
+
+                def _buffer_chunks(source, size, leftover):
+                    if size == 0:
+                        return next(source), None
+                    buf = []
+                    bytes_sofar = 0
+                    segment = leftover = b""
+                    while bytes_sofar < size:
+                        bytes = next(source)
+                        buf.append(bytes)
+                        bytes_sofar += len(bytes)
+                        # Buffer exactly 'size' bytes
+                        if bytes_sofar >= size:
+                            segment = b"".join(buf)
+                            leftover = segment[size:]
+                            segment = segment[:size]
+                    return segment, leftover
+
+                next_chunk = b""
+                object_segment_size = policy.ec_objsegsz if ec_policy else 0
                 while True:
                     with ChunkReadTimeout(self.app.client_timeout):
                         try:
-                            chunk = next(data_source)
+                            chunk, next_chunk = _buffer_chunks(
+                                data_source, object_segment_size, next_chunk)
                         except StopIteration:
                             for putter in putters:
-                                putter.end_of_object_data()
+                                # Write original object length and etag to the
+                                # metadata footer by default
+                                custom_putter_meta = {
+                                    'X-Object-Sysmeta-Content-Length':
+                                    object_bytes_transferred,
+                                    'X-Object-Sysmeta-Etag':
+                                    object_etag.hexdigest(),
+                                }
+                                # Add policy specific metadata
+                                custom_putter_meta.update(
+                                    policy.custom_meta(putters.index(putter)))
+                                putter.end_of_object_data(custom_putter_meta)
                             break
-                    bytes_transferred += len(chunk)
+                    # If policy is erasure_coding, encode object segment into
+                    # ec_ndata and ec_nparity fragments, before streaming
+                    # those to the object servers.
+                    if ec_policy:
+                        # Running md5sum for object data
+                        object_etag.update(chunk)
+                        # Encode and stream
+                        try:
+                            ec_fragments = policy.pyeclib_driver.encode(chunk)
+                        except ECDriverError:
+                            self.app.logger.error(_(
+                                'Object PUT exception during'
+                                ' ec_driver.encode()'))
+                            return HTTPServerError(request=req)
+
+                        ec_fragment = iter(ec_fragments)
+                        bytes_transferred += len(ec_fragments[0])
+                        object_bytes_transferred += len(chunk)
+                    else:
+                        bytes_transferred += len(chunk)
+
                     if bytes_transferred > constraints.MAX_FILE_SIZE:
                         return HTTPRequestEntityTooLarge(request=req)
                     for putter in list(putters):
                         if not putter.failed:
+                            if ec_policy:
+                                chunk = next(ec_fragment)
+                                ondisk_object_etags[putter].update(chunk)
                             putter.send_chunk(chunk)
                         else:
                             putters.remove(putter)
@@ -953,11 +1032,28 @@ class ObjectController(Controller):
         statuses, reasons, bodies, etags = self._get_put_responses(
             req, putters, nodes)
 
-        if len(etags) > 1:
-            self.app.logger.error(
-                _('Object servers returned %s mismatched etags'), len(etags))
-            return HTTPServerError(request=req)
-        etag = etags.pop() if len(etags) else None
+        if ec_policy:
+            # Validate etags received in response against EC fragment etags
+            mismatched_etags = 0
+            for putter in putters:
+                putter_tx_etag = ondisk_object_etags[putter].hexdigest()
+                if putter in etags and \
+                        putter_tx_etag != etags[putter]:
+                    mismatched_etags += 1
+            if mismatched_etags > 0:
+                self.app.logger.error(
+                    _('Object servers returned %s mismatched etags'),
+                    len(etags))
+            # Respond to the client with object etag
+            etag = object_etag.hexdigest()
+        else:
+            etags = set(etags.values())
+            if len(etags) > 1:
+                self.app.logger.error(
+                    _('Object servers returned %s mismatched etags'),
+                    len(etags))
+                return HTTPServerError(request=req)
+            etag = etags.pop() if len(etags) else None
         resp = self.best_response(req, statuses, reasons, bodies,
                                   _('Object PUT'), etag=etag)
         if source_header:

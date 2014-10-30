@@ -16,6 +16,7 @@ import textwrap
 import string
 
 from swift.common.utils import config_true_value, SWIFT_CONF_FILE
+from swift.common.constraints import EC_OBJECT_SEGMENT_SIZE
 from swift.common.ring import Ring
 from swift.common.utils import config_auto_int_value, replication_quorum_size
 from swift.common.exceptions import RingValidationError
@@ -153,6 +154,10 @@ class StoragePolicy(object):
         raise NotImplementedError("quorum_size is undefined for base "
                                   "StoragePolicy class ")
 
+    def custom_meta(self, idx=None):
+        raise NotImplementedError("custom_meta is undefined for base "
+                                  "StoragePolicy class ")
+
 
 class ReplicationStoragePolicy(StoragePolicy):
     """
@@ -182,6 +187,9 @@ class ReplicationStoragePolicy(StoragePolicy):
         """
         return replication_quorum_size(n)
 
+    def custom_meta(self, idx=None):
+        return {}
+
 
 class ECStoragePolicy(StoragePolicy):
     """
@@ -193,6 +201,7 @@ class ECStoragePolicy(StoragePolicy):
     """
     def __init__(self, idx, name='', is_default=False,
                  is_deprecated=False, object_ring=None,
+                 ec_objsegsz=EC_OBJECT_SEGMENT_SIZE,
                  ec_type=None, ec_ndata=None, ec_nparity=None):
 
         super(ECStoragePolicy, self).__init__(
@@ -225,6 +234,16 @@ class ECStoragePolicy(StoragePolicy):
         except ValueError:
             raise PolicyError('Invalid ec_num_parity_fragments', ec_nparity)
 
+        # Define _ec_objsegsz as the encode segment unit size
+        # Accessible as the property "ec_objsegsz"
+        try:
+            value = config_auto_int_value(ec_objsegsz, -1)
+            if value <= 0:
+                raise ValueError
+            self._ec_objsegsz = value
+        except ValueError:
+            raise PolicyError('Invalid ec_object_segment_size', ec_objsegsz)
+
         # Initialize PyECLib EC backend
         # raises ECDriverError
         try:
@@ -253,9 +272,10 @@ class ECStoragePolicy(StoragePolicy):
             self._ec_ndata + self.pyeclib_driver.min_parity_fragments_needed()
 
     def __repr__(self):
-        return "%s, EC config(ec_type=%s, ec_ndata=%d, ec_nparity=%d)" % (
-               StoragePolicy.__repr__(self),
-               self.ec_type, self.ec_ndata, self.ec_nparity)
+        return ("%s, EC config(ec_type=%s, ec_objsegsz=%d, "
+                "ec_ndata=%d, ec_nparity=%d)") % (
+                    StoragePolicy.__repr__(self), self.ec_type,
+                    self.ec_objsegsz, self.ec_ndata, self.ec_nparity)
 
     def validate_ring_node_count(self):
         """
@@ -277,6 +297,9 @@ class ECStoragePolicy(StoragePolicy):
     def ec_type(self):
         return self._ec_type
 
+    # TODO Add a new property for ec_type_version_str
+    # need to store this info with the fragment archive
+
     @property
     def ec_ndata(self):
         return self._ec_ndata
@@ -285,6 +308,10 @@ class ECStoragePolicy(StoragePolicy):
     def ec_nparity(self):
         return self._ec_nparity
 
+    @property
+    def ec_objsegsz(self):
+        return self._ec_objsegsz
+
     def quorum_size(self, n):
         """
         Number of successful backend requests needed for the proxy to consider
@@ -292,6 +319,18 @@ class ECStoragePolicy(StoragePolicy):
         the choice of EC scheme.
         """
         return self._ec_quorum_size
+
+    def custom_meta(self, idx=None):
+        km = str(self.ec_ndata) + '_' + str(self.ec_nparity)
+        info = self.pyeclib_driver.get_segment_info(0, self.ec_objsegsz)
+        ec_meta = {
+            'X-Object-Sysmeta-EC-Segment-Size': self.ec_objsegsz,
+            'X-Object-Sysmeta-EC-Fragment-Size': info['fragment_size'],
+            'X-Object-Sysmeta-EC-TypeVer': self.ec_type,
+            'X-Object-Sysmeta-EC-K_M': km,
+            'X-Object-Sysmeta-EC-Fragarchive-Index': idx,
+        }
+        return ec_meta
 
 
 class StoragePolicyCollection(object):
@@ -448,6 +487,7 @@ class StoragePolicyCollection(object):
                 policy_entry['default'] = pol.is_default
             if pol.policy_type == EC_POLICY:
                 policy_entry['ec_type'] = pol.ec_type
+                policy_entry['ec_objsegsz'] = pol.ec_objsegsz
                 policy_entry['ec_ndata'] = pol.ec_ndata
                 policy_entry['ec_nparity'] = pol.ec_nparity
             policy_info.append(policy_entry)
@@ -474,6 +514,7 @@ def parse_storage_policies(conf):
             'policy_type': 'policy_type',
             # ECStoragePolicy Specific options
             'ec_type': 'ec_type',
+            'ec_object_segment_size': 'ec_objsegsz',
             'ec_num_data_fragments': 'ec_ndata',
             'ec_num_parity_fragments': 'ec_nparity',
         }

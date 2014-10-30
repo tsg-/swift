@@ -74,6 +74,7 @@ class TestStoragePolicies(unittest.TestCase):
                   {'policy_type': REPL_POLICY, 'name': 'one'},
                   {'policy_type': EC_POLICY, 'name': 'ten',
                    'ec_type': 'jerasure_rs_vand',
+                   'ec_objsegsz': 1048576,
                    'ec_ndata': 10, 'ec_nparity': 4}]
         swift_info = POLICIES.get_policy_info()
         self.assertEquals(sorted(expect, key=lambda k: k['name']),
@@ -109,6 +110,7 @@ class TestStoragePolicies(unittest.TestCase):
             StoragePolicy.from_conf(
                 EC_POLICY, {'idx': 10, 'name': 'ten', 'is_default': False,
                             'ec_type': 'jerasure_rs_vand',
+                            'ec_objsegsz': 100,
                             'ec_ndata': 9, 'ec_nparity': 3})]
         policies = StoragePolicyCollection(test_policies)
         for policy in policies:
@@ -123,6 +125,8 @@ class TestStoragePolicies(unittest.TestCase):
                 self.assert_('ec_ndata=%s' % policy.ec_ndata in policy_repr)
                 self.assert_('ec_nparity=%s' %
                              policy.ec_nparity in policy_repr)
+                self.assert_('ec_objsegsz=%s' %
+                             policy.ec_objsegsz in policy_repr)
         collection_repr = repr(policies)
         collection_repr_lines = collection_repr.splitlines()
         self.assert_(policies.__class__.__name__ in collection_repr_lines[0])
@@ -691,6 +695,58 @@ class TestStoragePolicies(unittest.TestCase):
 
         self.assertRaisesWithMessage(PolicyError,
                                      'Invalid ec_num_parity_fragments',
+                                     parse_storage_policies, bad_conf)
+
+        # policy_type = erasure_coding, bad ec_object_segment_size (< 0)
+        bad_conf = self._conf("""
+        [storage-policy:0]
+        name = zero
+        [storage-policy:1]
+        name = ec10-4
+        policy_type = erasure_coding
+        ec_type = jerasure_rs_vand
+        ec_num_data_fragments = 10
+        ec_num_parity_fragments = 4
+        ec_object_segment_size = -4
+        """)
+
+        self.assertRaisesWithMessage(PolicyError,
+                                     'Invalid ec_object_segment_size',
+                                     parse_storage_policies, bad_conf)
+
+        # policy_type = erasure_coding, bad ec_object_segment_size (= 0)
+        bad_conf = self._conf("""
+        [storage-policy:0]
+        name = zero
+        [storage-policy:1]
+        name = ec10-4
+        policy_type = erasure_coding
+        ec_type = jerasure_rs_vand
+        ec_num_data_fragments = 10
+        ec_num_parity_fragments = 4
+        ec_object_segment_size = 0
+        """)
+
+        self.assertRaisesWithMessage(PolicyError,
+                                     'Invalid ec_object_segment_size',
+                                     parse_storage_policies, bad_conf)
+
+        # policy_type = erasure_coding, bad ec_object_segment_size
+        # (non-numeric)
+        bad_conf = self._conf("""
+        [storage-policy:0]
+        name = zero
+        [storage-policy:1]
+        name = ec10-4
+        policy_type = erasure_coding
+        ec_type = jerasure_rs_vand
+        ec_num_data_fragments = 10
+        ec_num_parity_fragments = 4
+        ec_object_segment_size = x
+        """)
+
+        self.assertRaisesWithMessage(PolicyError,
+                                     'Invalid ec_object_segment_size',
                                      parse_storage_policies, bad_conf)
 
         # Additional section added to ensure parser ignores other sections
