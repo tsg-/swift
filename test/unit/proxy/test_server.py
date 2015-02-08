@@ -4177,7 +4177,8 @@ class TestObjectController(unittest.TestCase):
 
             def fake_connect_put_node(nodes, part, path, headers,
                                       logger_thread_locals, chunked,
-                                      need_metadata_footer=False):
+                                      need_metadata_footer=False,
+                                      need_multiphase_put=False):
                 given_headers.update(headers)
 
             controller = proxy_server.ReplicatedObjectController(
@@ -4203,7 +4204,8 @@ class TestObjectController(unittest.TestCase):
 
             def fake_connect_put_node(nodes, part, path, headers,
                                       logger_thread_locals, chunked,
-                                      need_metadata_footer=False):
+                                      need_metadata_footer=False,
+                                      need_multiphase_put=False):
                 given_headers.update(headers)
 
             controller = proxy_server.ReplicatedObjectController(

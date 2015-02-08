@@ -4733,6 +4733,29 @@ class TestObjectServer(unittest.TestCase):
         resp.read()
         resp.close()
 
+    def test_expect_on_put_multipart(self):
+        test_body = 'test'
+        commit_confirmation_body = 'commit_confirmation'
+        put_timestamp = utils.Timestamp(time())
+        headers = {
+            'Expect': '100-continue',
+            'Content-Length': len(test_body),
+            'X-Timestamp': put_timestamp.internal,
+            'X-Backend-Obj-Metadata-Footer': 'yes',
+            'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary123',
+            'X-Backend-Obj-Multiphase-Commit': 'yes',
+        }
+        conn = bufferedhttp.http_connect('127.0.0.1', self.port, 'sda1', '0',
+                                         'PUT', '/a/c/o', headers=headers)
+        resp = conn.getexpect()
+        self.assertEqual(resp.status, 100)
+        headers = HeaderKeyDict(resp.getheaders())
+        self.assertEqual(headers['X-Obj-Metadata-Footer'], 'yes')
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 201)
+        resp.read()
+        resp.close()
+
 
 class TestZeroCopy(unittest.TestCase):
     """Test the object server's zero-copy functionality"""

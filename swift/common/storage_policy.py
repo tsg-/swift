@@ -163,6 +163,10 @@ class StoragePolicy(object):
     def needs_trailing_object_metadata(self):
         return False
 
+    @property
+    def needs_multiphase_put(self):
+        raise NotImplementedError
+
 
 class ReplicationStoragePolicy(StoragePolicy):
     """
@@ -207,6 +211,10 @@ class ReplicationStoragePolicy(StoragePolicy):
     def trailing_metadata(self, *a, **kw):
         # Replicated objects don't need to store anything extra.
         return {}
+
+    @property
+    def needs_multiphase_put(self):
+        return False
 
 
 class ECStoragePolicy(StoragePolicy):
@@ -444,6 +452,10 @@ class ECStoragePolicy(StoragePolicy):
             'X-Object-Sysmeta-EC-Scheme': self.ec_scheme_description,
             'X-Object-Sysmeta-EC-Segment-Size': str(self.ec_segment_size),
         }
+
+    @property
+    def needs_multiphase_put(self):
+        return True
 
 
 class StoragePolicyCollection(object):
